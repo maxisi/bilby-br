@@ -9,6 +9,7 @@ from ...core.utils import (
     logger, create_frequency_series, speed_of_light, radius_of_earth
 )
 from ..prior import CBCPriorDict
+from ..utils import ln_i0
 
 
 class ROQGravitationalWaveTransient(GravitationalWaveTransient):
@@ -159,7 +160,16 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
             if number_of_bases > 1:
                 self._verify_prior_ranges_and_frequency_nodes(basis_type)
             else:
-                self._check_frequency_nodes_exist(basis_type)
+                self._check_frequency_nodes_exist_for_single_basis(basis_type)
+
+        self._set_unique_frequency_nodes_and_inverse()
+        # need to fill waveform_arguments here if single basis is used, as they will never be updated.
+        if self.number_of_bases_linear == 1 and self.number_of_bases_quadratic == 1:
+            frequency_nodes, linear_indices, quadratic_indices = \
+                self._unique_frequency_nodes_and_inverse[0][0]
+            self._waveform_generator.waveform_arguments['frequency_nodes'] = frequency_nodes
+            self._waveform_generator.waveform_arguments['linear_indices'] = linear_indices
+            self._waveform_generator.waveform_arguments['quadratic_indices'] = quadratic_indices
 
     def _verify_prior_ranges_and_frequency_nodes(self, basis_type):
         """
@@ -195,10 +205,11 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
                 raise ValueError(
                     f'The number of arrays of frequency nodes does not match the number of {basis_type} bases')
 
-    def _check_frequency_nodes_exist(self, basis_type):
+    def _check_frequency_nodes_exist_for_single_basis(self, basis_type):
         """
-        Check if self._waveform_generator.waveform_arguments contains frequency nodes. If not, they are retrieved from
-        self.weights. If self.weights neither, raise AttributeError.
+        For a single-basis case, frequency nodes should be contained in self._waveform_generator.waveform_arguments or
+        self.weights. This method checks if it is the case and raise AttributeError if not. This method also adds
+        frequency nodes to self._waveform_generator.waveform_arguments or self.weights from the other.
 
         Parameters
         ==========
@@ -206,12 +217,34 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
 
         """
         key = f'frequency_nodes_{basis_type}'
-        if key not in self._waveform_generator.waveform_arguments:
-            try:
-                self._waveform_generator.waveform_arguments[key] = self.weights[key][0]
-            except KeyError:
-                raise AttributeError(
-                    f'{key} should be contained in weights or waveform arguments.')
+        if not (key in self.weights or key in self._waveform_generator.waveform_arguments):
+            raise AttributeError(f'{key} should be contained in weights or waveform arguments.')
+        elif key not in self._waveform_generator.waveform_arguments:
+            self._waveform_generator.waveform_arguments[key] = self.weights[key][0]
+        elif key not in self.weights:
+            self.weights[key] = [self._waveform_generator.waveform_arguments[key]]
+
+    def _set_unique_frequency_nodes_and_inverse(self):
+        """Set unique frequency nodes and indices to recover linear and quadratic frequency nodes for each combination
+        of linear and quadratic bases
+        """
+        self._unique_frequency_nodes_and_inverse = []
+        for idx_linear in range(self.number_of_bases_linear):
+            tmp = []
+            frequency_nodes_linear = self.weights['frequency_nodes_linear'][idx_linear]
+            size_linear = len(frequency_nodes_linear)
+            for idx_quadratic in range(self.number_of_bases_quadratic):
+                frequency_nodes_quadratic = self.weights['frequency_nodes_quadratic'][idx_quadratic]
+                frequency_nodes_unique, original_indices = np.unique(
+                    np.hstack((frequency_nodes_linear, frequency_nodes_quadratic)),
+                    return_inverse=True
+                )
+                linear_indices = original_indices[:size_linear]
+                quadratic_indices = original_indices[size_linear:]
+                tmp.append(
+                    (frequency_nodes_unique, linear_indices, quadratic_indices)
+                )
+            self._unique_frequency_nodes_and_inverse.append(tmp)
 
     def _setup_time_marginalization(self):
         if self._delta_tc is None:
@@ -310,7 +343,9 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
         for basis_type, number_of_bases in zip(
             ['linear', 'quadratic'], [self.number_of_bases_linear, self.number_of_bases_quadratic]
         ):
+            basis_number_key = f'basis_number_{basis_type}'
             if number_of_bases == 1:
+                self._cache[basis_number_key] = 0
                 continue
             in_prior_range = np.ones(number_of_bases, dtype=bool)
             prior_range_key = f'prior_range_{basis_type}'
@@ -320,16 +355,19 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
                 in_prior_range *= \
                     (self.weights[prior_range_key][param_name][:, 0] <= parameters[param_name]) * \
                     (self.weights[prior_range_key][param_name][:, 1] >= parameters[param_name])
-            basis_number_key = f'basis_number_{basis_type}'
             self._cache[basis_number_key] = np.arange(number_of_bases)[in_prior_range][0]
-            frequency_nodes_key = f'frequency_nodes_{basis_type}'
-            self._waveform_generator.waveform_arguments[frequency_nodes_key] = \
-                self.weights[frequency_nodes_key][self._cache[basis_number_key]]
+        basis_number_linear = self._cache['basis_number_linear']
+        basis_number_quadratic = self._cache['basis_number_quadratic']
+        frequency_nodes, linear_indices, quadratic_indices = \
+            self._unique_frequency_nodes_and_inverse[basis_number_linear][basis_number_quadratic]
+        self._waveform_generator.waveform_arguments['frequency_nodes'] = frequency_nodes
+        self._waveform_generator.waveform_arguments['linear_indices'] = linear_indices
+        self._waveform_generator.waveform_arguments['quadratic_indices'] = quadratic_indices
         self._cache['parameters'] = self.parameters.copy()
 
     @property
     def basis_number_linear(self):
-        if self.number_of_bases_linear > 1:
+        if self.number_of_bases_linear > 1 or self.number_of_bases_quadratic > 1:
             if self.parameters != self._cache['parameters']:
                 self._update_basis()
             return self._cache['basis_number_linear']
@@ -338,7 +376,7 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
 
     @property
     def basis_number_quadratic(self):
-        if self.number_of_bases_quadratic > 1:
+        if self.number_of_bases_linear > 1 or self.number_of_bases_quadratic > 1:
             if self.parameters != self._cache['parameters']:
                 self._update_basis()
             return self._cache['basis_number_quadratic']
@@ -356,7 +394,7 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
     def waveform_generator(self, waveform_generator):
         self._waveform_generator = waveform_generator
 
-    def calculate_snrs(self, waveform_polarizations, interferometer):
+    def calculate_snrs(self, waveform_polarizations, interferometer, return_array=True):
         """
         Compute the snrs for ROQ
 
@@ -371,26 +409,27 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
         else:
             time_ref = self.parameters['geocent_time']
 
-        size_linear = len(self.waveform_generator.waveform_arguments['frequency_nodes_linear'])
-        size_quadratic = len(self.waveform_generator.waveform_arguments['frequency_nodes_quadratic'])
+        frequency_nodes = self.waveform_generator.waveform_arguments['frequency_nodes']
+        linear_indices = self.waveform_generator.waveform_arguments['linear_indices']
+        quadratic_indices = self.waveform_generator.waveform_arguments['quadratic_indices']
+        size_linear = len(linear_indices)
+        size_quadratic = len(quadratic_indices)
         h_linear = np.zeros(size_linear, dtype=complex)
         h_quadratic = np.zeros(size_quadratic, dtype=complex)
         for mode in waveform_polarizations['linear']:
             response = interferometer.antenna_response(
                 self.parameters['ra'], self.parameters['dec'],
-                self.parameters['geocent_time'], self.parameters['psi'],
+                time_ref,
+                self.parameters['psi'],
                 mode
             )
             h_linear += waveform_polarizations['linear'][mode] * response
             h_quadratic += waveform_polarizations['quadratic'][mode] * response
 
-        calib_linear = interferometer.calibration_model.get_calibration_factor(
-            size_linear, prefix='recalib_{}_'.format(interferometer.name), **self.parameters)
-        calib_quadratic = interferometer.calibration_model.get_calibration_factor(
-            size_quadratic, prefix='recalib_{}_'.format(interferometer.name), **self.parameters)
-
-        h_linear *= calib_linear
-        h_quadratic *= calib_quadratic
+        calib_factor = interferometer.calibration_model.get_calibration_factor(
+            frequency_nodes, prefix='recalib_{}_'.format(interferometer.name), **self.parameters)
+        h_linear *= calib_factor[linear_indices]
+        h_quadratic *= calib_factor[quadratic_indices]
 
         optimal_snr_squared = np.vdot(
             np.abs(h_quadratic)**2,
@@ -399,22 +438,16 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
 
         dt = interferometer.time_delay_from_geocenter(
             self.parameters['ra'], self.parameters['dec'], time_ref)
+        dt_geocent = self.parameters['geocent_time'] - interferometer.strain_data.start_time
+        ifo_time = dt_geocent + dt
 
-        if not self.time_marginalization:
-            dt_geocent = self.parameters['geocent_time'] - interferometer.strain_data.start_time
-            ifo_time = dt_geocent + dt
-
-            indices, in_bounds = self._closest_time_indices(
-                ifo_time, self.weights['time_samples'])
-            if not in_bounds:
-                logger.debug("SNR calculation error: requested time at edge of ROQ time samples")
-                return self._CalculatedSNRs(
-                    d_inner_h=np.nan_to_num(-np.inf), optimal_snr_squared=0,
-                    complex_matched_filter_snr=np.nan_to_num(-np.inf),
-                    d_inner_h_squared_tc_array=None,
-                    d_inner_h_array=None,
-                    optimal_snr_squared_array=None)
-
+        indices, in_bounds = self._closest_time_indices(
+            ifo_time, self.weights['time_samples'])
+        if not in_bounds:
+            logger.debug("SNR calculation error: requested time at edge of ROQ time samples")
+            d_inner_h = -np.inf
+            complex_matched_filter_snr = -np.inf
+        else:
             d_inner_h_tc_array = np.einsum(
                 'i,ji->j', np.conjugate(h_linear),
                 self.weights[interferometer.name + '_linear'][self.basis_number_linear][indices])
@@ -425,23 +458,21 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
             with np.errstate(invalid="ignore"):
                 complex_matched_filter_snr = d_inner_h / (optimal_snr_squared**0.5)
 
-            d_inner_h_array = None
-
-        else:
-            ifo_times = self._times - interferometer.strain_data.start_time + dt
+        if return_array and self.time_marginalization:
+            ifo_times = self._times - interferometer.strain_data.start_time
+            ifo_times += dt
             if self.jitter_time:
                 ifo_times += self.parameters['time_jitter']
             d_inner_h_array = self._calculate_d_inner_h_array(ifo_times, h_linear, interferometer.name)
-
-            d_inner_h = 0.
-            complex_matched_filter_snr = 0.
+        else:
+            d_inner_h_array = None
 
         return self._CalculatedSNRs(
-            d_inner_h=d_inner_h, optimal_snr_squared=optimal_snr_squared,
+            d_inner_h=d_inner_h,
+            optimal_snr_squared=optimal_snr_squared.real,
             complex_matched_filter_snr=complex_matched_filter_snr,
-            d_inner_h_squared_tc_array=None,
             d_inner_h_array=d_inner_h_array,
-            optimal_snr_squared_array=None)
+        )
 
     @staticmethod
     def _closest_time_indices(time, samples):
@@ -913,19 +944,30 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
                 self.weights[ifo.name + '_quadratic'].append(
                     np.dot(quadratic_matrix_single, multibanded_inverse_psd[ifo.name]))
 
-    def save_weights(self, filename, format='npz'):
+    def save_weights(self, filename, format='hdf5'):
         """
-        Save ROQ weights into a single file. format should be json, npz, or hdf5. For weights from multiple bases, hdf5
-        is only the possible option.
+        Save ROQ weights into a single file. format should be npz, or hdf5.
+        For weights from multiple bases, hdf5 is only the possible option.
+        Support for json format is deprecated as of :code:`v2.1` and will be
+        removed in :code:`v2.2`, another method should be used by default.
 
         Parameters
         ==========
         filename : str
+            The name of the file to save the weights to.
         format : str
-
+            The format to save the data to, this should be one of
+            :code:`"hdf5"`, :code:`"npz"`, default=:code:`"hdf5"`.
         """
         if format not in ['json', 'npz', 'hdf5']:
             raise IOError(f"Format {format} not recognized.")
+        if format == "json":
+            import warnings
+
+            warnings.warn(
+                "json format for ROQ weights is deprecated, use hdf5 instead.",
+                DeprecationWarning
+            )
         if format not in filename:
             filename += "." + format
         logger.info(f"Saving ROQ weights to {filename}")
@@ -970,19 +1012,35 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
 
     def load_weights(self, filename, format=None):
         """
-        Load ROQ weights. format should be json, npz, or hdf5. json or npz file is assumed to contain weights from a
-        single basis
+        Load ROQ weights. format should be json, npz, or hdf5.
+        json or npz file is assumed to contain weights from a single basis.
+        Support for json format is deprecated as of :code:`v2.1` and will be
+        removed in :code:`v2.2`, another method should be used by default.
 
         Parameters
         ==========
         filename : str
+            The name of the file to save the weights to.
         format : str
+            The format to save the data to, this should be one of
+            :code:`"hdf5"`, :code:`"npz"`, default=:code:`"hdf5"`.
 
+        Returns
+        =======
+        weights: dict
+            Dictionary containing the ROQ weights.
         """
         if format is None:
             format = filename.split(".")[-1]
         if format not in ["json", "npz", "hdf5"]:
             raise IOError(f"Format {format} not recognized.")
+        if format == "json":
+            import warnings
+
+            warnings.warn(
+                "json format for ROQ weights is deprecated, use hdf5 instead.",
+                DeprecationWarning
+            )
         logger.info(f"Loading ROQ weights from {filename}")
         if format == "json" or format == "npz":
             # Old file format assumed to contain only a single basis
@@ -1091,6 +1149,38 @@ class ROQGravitationalWaveTransient(GravitationalWaveTransient):
         for kind in ['linear', 'quadratic']:
             for mode in signal[kind]:
                 signal[kind][mode] *= self._ref_dist / new_distance
+
+    def generate_time_sample_from_marginalized_likelihood(self, signal_polarizations=None):
+        self.parameters.update(self.get_sky_frame_parameters())
+        if signal_polarizations is None:
+            signal_polarizations = \
+                self.waveform_generator.frequency_domain_strain(self.parameters)
+
+        snrs = self._CalculatedSNRs()
+
+        for interferometer in self.interferometers:
+            snrs += self.calculate_snrs(
+                waveform_polarizations=signal_polarizations,
+                interferometer=interferometer
+            )
+        d_inner_h = snrs.d_inner_h_array
+        h_inner_h = snrs.optimal_snr_squared
+
+        if self.distance_marginalization:
+            time_log_like = self.distance_marginalized_likelihood(
+                d_inner_h, h_inner_h)
+        elif self.phase_marginalization:
+            time_log_like = ln_i0(abs(d_inner_h)) - h_inner_h.real / 2
+        else:
+            time_log_like = (d_inner_h.real - h_inner_h.real / 2)
+
+        times = self._times
+        if self.jitter_time:
+            times = times + self.parameters["time_jitter"]
+        time_prior_array = self.priors['geocent_time'].prob(times)
+        time_post = np.exp(time_log_like - max(time_log_like)) * time_prior_array
+        time_post /= np.sum(time_post)
+        return np.random.choice(times, p=time_post)
 
 
 class BilbyROQParamsRangeError(Exception):

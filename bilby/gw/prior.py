@@ -415,7 +415,7 @@ class UniformInComponentsMassRatio(Prior):
     """
 
     def __init__(self, minimum, maximum, name='mass_ratio', latex_label='$q$',
-                 unit=None, boundary=None):
+                 unit=None, boundary=None, equal_mass=False):
         """
         Parameters
         ==========
@@ -427,7 +427,14 @@ class UniformInComponentsMassRatio(Prior):
         latex_label: see superclass
         unit: see superclass
         boundary: see superclass
+        equal_mass: bool
+            Whether the likelihood being considered is expected to peak at
+            equal masses. If True, the mapping described in Appendix A of
+            arXiv:2111.13619 is used in the :code:`rescale` method.
+            default=False
+
         """
+        self.equal_mass = equal_mass
         super(UniformInComponentsMassRatio, self).__init__(
             minimum=minimum, maximum=maximum, name=name,
             latex_label=latex_label, unit=unit, boundary=boundary)
@@ -445,6 +452,8 @@ class UniformInComponentsMassRatio(Prior):
         return (self._integral(val) - self._integral(self.minimum)) / self.norm
 
     def rescale(self, val):
+        if self.equal_mass:
+            val = 2 * np.minimum(val, 1 - val)
         resc = self.icdf(val)
         if resc.ndim == 0:
             return resc.item()
@@ -743,8 +752,21 @@ class CBCPriorDict(ConditionalPriorDict):
             return None
 
     def is_nonempty_intersection(self, pset):
-        """ Check if keys in self exist in the PARAMETER_SETS pset """
-        if len(PARAMETER_SETS[pset].intersection(self.non_fixed_keys)) > 0:
+        """ Check if keys in self exist in the parameter set
+
+        Parameters
+        ----------
+        pset: str, set
+            Either a string referencing a parameter set in PARAMETER_SETS or
+            a set of keys
+        """
+        if isinstance(pset, str) and pset in PARAMETER_SETS:
+            check_set = PARAMETER_SETS[pset]
+        elif isinstance(pset, set):
+            check_set = pset
+        else:
+            raise ValueError(f"pset {pset} not understood")
+        if len(check_set.intersection(self.non_fixed_keys)) > 0:
             return True
         else:
             return False
@@ -760,6 +782,11 @@ class CBCPriorDict(ConditionalPriorDict):
         return self.is_nonempty_intersection("precession_only")
 
     @property
+    def measured_spin(self):
+        """ Return true if priors include any measured_spin parameters """
+        return self.is_nonempty_intersection("measured_spin")
+
+    @property
     def intrinsic(self):
         """ Return true if priors include any intrinsic parameters """
         return self.is_nonempty_intersection("intrinsic")
@@ -768,6 +795,16 @@ class CBCPriorDict(ConditionalPriorDict):
     def extrinsic(self):
         """ Return true if priors include any extrinsic parameters """
         return self.is_nonempty_intersection("extrinsic")
+
+    @property
+    def sky(self):
+        """ Return true if priors include any extrinsic parameters """
+        return self.is_nonempty_intersection("sky")
+
+    @property
+    def distance_inclination(self):
+        """ Return true if priors include any extrinsic parameters """
+        return self.is_nonempty_intersection("distance_inclination")
 
     @property
     def mass(self):
@@ -994,8 +1031,8 @@ class BNSPriorDict(CBCPriorDict):
     def test_redundancy(self, key, disable_logging=False):
         logger.disabled = disable_logging
         logger.info("Performing redundancy check using BBHPriorDict(self).test_redundancy")
-        logger.disabled = False
         bbh_redundancy = BBHPriorDict(self).test_redundancy(key)
+        logger.disabled = False
 
         if bbh_redundancy:
             return True
@@ -1183,7 +1220,7 @@ class CalibrationPriorDict(PriorDict):
     @staticmethod
     def constant_uncertainty_spline(
             amplitude_sigma, phase_sigma, minimum_frequency, maximum_frequency,
-            n_nodes, label):
+            n_nodes, label, boundary="reflective"):
         """
         Make prior assuming constant in frequency calibration uncertainty.
 
@@ -1203,6 +1240,8 @@ class CalibrationPriorDict(PriorDict):
             Number of nodes for the spline.
         label: str
             Label for the names of the parameters, e.g., `recalib_H1_`
+        boundary: None, 'reflective', 'periodic'
+            The type of prior boundary to assign
 
         Returns
         =======
@@ -1225,14 +1264,14 @@ class CalibrationPriorDict(PriorDict):
             prior[name] = Gaussian(mu=amplitude_mean_nodes[ii],
                                    sigma=amplitude_sigma_nodes[ii],
                                    name=name, latex_label=latex_label,
-                                   boundary='reflective')
+                                   boundary=boundary)
         for ii in range(n_nodes):
             name = "recalib_{}_phase_{}".format(label, ii)
             latex_label = r"$\phi^{}_{}$".format(label, ii)
             prior[name] = Gaussian(mu=phase_mean_nodes[ii],
                                    sigma=phase_sigma_nodes[ii],
                                    name=name, latex_label=latex_label,
-                                   boundary='reflective')
+                                   boundary=boundary)
         for ii in range(n_nodes):
             name = "recalib_{}_frequency_{}".format(label, ii)
             latex_label = "$f^{}_{}$".format(label, ii)
@@ -1323,11 +1362,11 @@ class HealPixMapPriorDist(BaseJointPriorDist):
                 bounds.append([0, np.inf])
             self.distance = True
             self.prob, self.distmu, self.distsigma, self.distnorm = self.hp.read_map(
-                hp_file, verbose=False, field=range(4)
+                hp_file, field=range(4)
             )
         else:
             self.distance = False
-            self.prob = self.hp.read_map(hp_file, verbose=False)
+            self.prob = self.hp.read_map(hp_file)
 
         super(HealPixMapPriorDist, self).__init__(names=names, bounds=bounds)
         self.distname = "hpmap"
@@ -1339,7 +1378,6 @@ class HealPixMapPriorDist(BaseJointPriorDist):
         self._all_interped = interp1d(x=self.pix_xx, y=self.prob, bounds_error=False, fill_value=0)
         self.inverse_cdf = None
         self.distance_pdf = None
-        self.distance_dist = None
         self.distance_icdf = None
         self._build_attributes()
         name = self.names[-1]
@@ -1427,14 +1465,6 @@ class HealPixMapPriorDist(BaseJointPriorDist):
         ).pdf(r)
         pdfs = self.rs ** 2 * norm(loc=self.distmu[pix_idx], scale=self.distsigma[pix_idx]).pdf(self.rs)
         cdfs = np.cumsum(pdfs) / np.sum(pdfs)
-
-        def sample_distance(n):
-            gaussian = norm(loc=self.distmu[pix_idx], scale=self.distsigma[pix_idx]).rvs(size=100 * n)
-            probs = self._check_norm(gaussian[gaussian > 0] ** 2)
-            ds = np.random.choice(gaussian[gaussian > 0], p=probs, size=n, replace=True)
-            return ds
-
-        self.distance_dist = sample_distance
         self.distance_icdf = interp1d(cdfs, self.rs)
 
     @staticmethod
@@ -1510,7 +1540,7 @@ class HealPixMapPriorDist(BaseJointPriorDist):
         """
         if self.distmu[pix] == np.inf or self.distmu[pix] <= 0:
             return 0
-        dist = self.distance_dist(1)
+        dist = self.distance_icdf(np.random.uniform(0, 1))
         name = self.names[-1]
         if (dist > self.bounds[name][1]) | (dist < self.bounds[name][0]):
             self.draw_distance(pix)
@@ -1603,7 +1633,7 @@ class HealPixMapPriorDist(BaseJointPriorDist):
         return lnprob
 
     def __eq__(self, other):
-        skip_keys = ["_all_interped", "inverse_cdf", "distance_pdf", "distance_dist", "distance_icdf"]
+        skip_keys = ["_all_interped", "inverse_cdf", "distance_pdf", "distance_icdf"]
         if self.__class__ != other.__class__:
             return False
         if sorted(self.__dict__.keys()) != sorted(other.__dict__.keys()):

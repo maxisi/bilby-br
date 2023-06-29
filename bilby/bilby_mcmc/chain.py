@@ -1,7 +1,6 @@
-from distutils.version import LooseVersion
-
 import numpy as np
 import pandas as pd
+from packaging import version
 
 from ..core.sampler.base_sampler import SamplerError
 from ..core.utils import logger
@@ -158,7 +157,7 @@ class Chain(object):
 
     @property
     def minimum_index(self):
-        """This calculated a minimum index from which to discard samples
+        """This calculates a minimum index from which to discard samples
 
         A number of methods are provided for the calculation. A subset are
         switched off (by `if False` statements) for future development
@@ -343,7 +342,12 @@ class Chain(object):
     @property
     def nsamples(self):
         nuseable_steps = self.position - self.minimum_index
-        return int(nuseable_steps / (self.thin_by_nact * self.tau))
+        n_independent_samples = nuseable_steps / self.tau
+        nsamples = int(n_independent_samples / self.thin_by_nact)
+        if nuseable_steps >= nsamples:
+            return nsamples
+        else:
+            return 0
 
     @property
     def nsamples_last(self):
@@ -512,7 +516,7 @@ class Sample(object):
 def calculate_tau(x, autocorr_c=5):
     import emcee
 
-    if LooseVersion(emcee.__version__) < LooseVersion("3"):
+    if version.parse(emcee.__version__) < version.parse("3"):
         raise SamplerError("bilby-mcmc requires emcee > 3.0 for autocorr analysis")
 
     if np.all(np.diff(x) == 0):

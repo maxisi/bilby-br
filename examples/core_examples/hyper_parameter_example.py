@@ -4,7 +4,6 @@ An example of how to use bilby to perform parameter estimation for hyper params
 """
 import matplotlib.pyplot as plt
 import numpy as np
-
 from bilby.core.likelihood import GaussianLikelihood
 from bilby.core.prior import Uniform
 from bilby.core.result import make_pp_plot
@@ -104,8 +103,6 @@ result = run_sampler(
     likelihood=hp_likelihood,
     priors=hp_priors,
     sampler="dynesty",
-    walks=10,
-    nact=3,
     nlive=1000,
     use_ratio=False,
     outdir=outdir,

@@ -6,7 +6,8 @@ from collections import namedtuple
 from copy import copy
 from importlib import import_module
 from itertools import product
-
+import multiprocessing
+from functools import partial
 import numpy as np
 import pandas as pd
 import scipy.stats
@@ -22,11 +23,17 @@ from .utils import (
     recursively_save_dict_contents_to_group,
     recursively_load_dict_contents_from_group,
     recursively_decode_bilby_json,
+    safe_file_dump,
 )
 from .prior import Prior, PriorDict, DeltaFunction, ConditionalDeltaFunction
 
 
 EXTENSIONS = ["json", "hdf5", "h5", "pickle", "pkl"]
+
+
+def __eval_l(likelihood, params):
+    likelihood.parameters.update(params)
+    return likelihood.log_likelihood()
 
 
 def result_file_name(outdir, label, extension='json', gzip=False):
@@ -69,7 +76,7 @@ def _determine_file_name(filename, outdir, label, extension, gzip):
             return result_file_name(outdir, label, extension, gzip)
 
 
-def read_in_result(filename=None, outdir=None, label=None, extension='json', gzip=False):
+def read_in_result(filename=None, outdir=None, label=None, extension='json', gzip=False, result_class=None):
     """ Reads in a stored bilby result object
 
     Parameters
@@ -79,9 +86,17 @@ def read_in_result(filename=None, outdir=None, label=None, extension='json', gzi
     outdir, label, extension: str
         Name of the output directory, label and extension used for the default
         naming scheme.
-
+    result_class: bilby.core.result.Result, or child of
+        The result class to use. By default, `bilby.core.result.Result` is used,
+        but objects which inherit from this class can be given providing
+        additional methods.
     """
     filename = _determine_file_name(filename, outdir, label, extension, gzip)
+
+    if result_class is None:
+        result_class = Result
+    elif not issubclass(result_class, Result):
+        raise ValueError(f"Input result_class={result_class} not understood")
 
     # Get the actual extension (may differ from the default extension if the filename is given)
     extension = os.path.splitext(filename)[1].lstrip('.')
@@ -89,11 +104,11 @@ def read_in_result(filename=None, outdir=None, label=None, extension='json', gzi
         extension = os.path.splitext(os.path.splitext(filename)[0])[1].lstrip('.')
 
     if 'json' in extension:
-        result = Result.from_json(filename=filename)
+        result = result_class.from_json(filename=filename)
     elif ('hdf5' in extension) or ('h5' in extension):
-        result = Result.from_hdf5(filename=filename)
+        result = result_class.from_hdf5(filename=filename)
     elif ("pkl" in extension) or ("pickle" in extension):
-        result = Result.from_pickle(filename=filename)
+        result = result_class.from_pickle(filename=filename)
     elif extension is None:
         raise ValueError("No filetype extension provided")
     else:
@@ -101,9 +116,37 @@ def read_in_result(filename=None, outdir=None, label=None, extension='json', gzi
     return result
 
 
+def read_in_result_list(filename_list, invalid="warning"):
+    """ Read in a set of results
+
+    Parameters
+    ==========
+    filename_list: list
+        A list of filename paths
+    invalid: str (ignore, warning, error)
+        Behaviour if a file in filename_list is not a valid bilby result
+
+    Returns
+    -------
+    result_list: ResultList
+        A list of results
+    """
+    results_list = []
+    for filename in filename_list:
+        try:
+            results_list.append(read_in_result(filename=filename))
+        except Exception as e:
+            msg = f"Failed to read in file {filename} due to exception {e}"
+            if invalid == "error":
+                raise ResultListError(msg)
+            elif invalid == "warning":
+                logger.warning(msg)
+    return ResultList(results_list)
+
+
 def get_weights_for_reweighting(
         result, new_likelihood=None, new_prior=None, old_likelihood=None,
-        old_prior=None, resume_file=None, n_checkpoint=5000):
+        old_prior=None, resume_file=None, n_checkpoint=5000, npool=1):
     """ Calculate the weights for reweight()
 
     See bilby.core.result.reweight() for help with the inputs
@@ -144,30 +187,45 @@ def get_weights_for_reweighting(
 
         starting_index = 0
 
-    for ii, sample in tqdm(result.posterior.iloc[starting_index:].iterrows()):
-        # Convert sample to dictionary
-        par_sample = {key: sample[key] for key in result.posterior}
+    dict_samples = [{key: sample[key] for key in result.posterior}
+                    for _, sample in result.posterior.iterrows()]
+    n = len(dict_samples) - starting_index
 
-        if old_likelihood is not None:
-            old_likelihood.parameters.update(par_sample)
-            old_log_likelihood_array[ii] = old_likelihood.log_likelihood()
-        else:
-            old_log_likelihood_array[ii] = sample["log_likelihood"]
+    # Helper function to compute likelihoods in parallel
+    def eval_pool(this_logl):
+        with multiprocessing.Pool(processes=npool) as pool:
+            chunksize = max(100, n // (2 * npool))
+            return list(tqdm(
+                pool.imap(partial(__eval_l, this_logl),
+                        dict_samples[starting_index:], chunksize=chunksize),
+                desc='Computing likelihoods',
+                total=n)
+            )
 
-        if new_likelihood is not None:
-            new_likelihood.parameters.update(par_sample)
-            new_log_likelihood_array[ii] = new_likelihood.log_likelihood()
-        else:
-            # Don't perform likelihood reweighting (i.e. likelihood isn't updated)
-            new_log_likelihood_array[ii] = old_log_likelihood_array[ii]
+    if old_likelihood is None:
+        old_log_likelihood_array[starting_index:] = \
+            result.posterior["log_likelihood"][starting_index:].to_numpy()
+    else:
+        old_log_likelihood_array[starting_index:] = eval_pool(old_likelihood)
 
+    if new_likelihood is None:
+        # Don't perform likelihood reweighting (i.e. likelihood isn't updated)
+        new_log_likelihood_array[starting_index:] = old_log_likelihood_array[starting_index:]
+    else:
+        new_log_likelihood_array[starting_index:] = eval_pool(new_likelihood)
+
+    # Compute priors
+    for ii, sample in enumerate(tqdm(dict_samples[starting_index:],
+                                     desc='Computing priors',
+                                     total=n),
+                                start=starting_index):
         if old_prior is not None:
-            old_log_prior_array[ii] = old_prior.ln_prob(par_sample)
+            old_log_prior_array[ii] = old_prior.ln_prob(sample)
         else:
             old_log_prior_array[ii] = sample["log_prior"]
 
         if new_prior is not None:
-            new_log_prior_array[ii] = new_prior.ln_prob(par_sample)
+            new_log_prior_array[ii] = new_prior.ln_prob(sample)
         else:
             # Don't perform prior reweighting (i.e. prior isn't updated)
             new_log_prior_array[ii] = old_log_prior_array[ii]
@@ -271,12 +329,12 @@ def reweight(result, label=None, new_likelihood=None, new_prior=None,
         get_weights_for_reweighting(
             result, new_likelihood=new_likelihood, new_prior=new_prior,
             old_likelihood=old_likelihood, old_prior=old_prior,
-            resume_file=resume_file, n_checkpoint=n_checkpoint)
-
-    weights = np.exp(ln_weights)
+            resume_file=resume_file, n_checkpoint=n_checkpoint, npool=npool)
 
     if use_nested_samples:
-        weights *= result.posterior['weights']
+        ln_weights += np.log(result.posterior["weights"])
+
+    weights = np.exp(ln_weights)
 
     # Overwrite the likelihood and prior evaluations
     result.posterior["log_likelihood"] = new_log_likelihood_array
@@ -298,7 +356,7 @@ def reweight(result, label=None, new_likelihood=None, new_prior=None,
 
     if conversion_function is not None:
         data_frame = result.posterior
-        if "npool" in inspect.getargspec(conversion_function).args:
+        if "npool" in inspect.signature(conversion_function).parameters:
             data_frame = conversion_function(data_frame, new_likelihood, new_prior, npool=npool)
         else:
             data_frame = conversion_function(data_frame, new_likelihood, new_prior)
@@ -401,6 +459,8 @@ class Result(object):
         self.injection_parameters = injection_parameters
         self.posterior = posterior
         self.samples = samples
+        if isinstance(nested_samples, dict):
+            nested_samples = pd.DataFrame(nested_samples)
         self.nested_samples = nested_samples
         self.walkers = walkers
         self.nburn = nburn
@@ -678,7 +738,7 @@ class Result(object):
 
         Writes the Result to a file.
 
-        Supported formats are: `json`, `hdf5`, `arviz`, `pickle`
+        Supported formats are: `json`, `hdf5`, `pickle`
 
         Parameters
         ==========
@@ -735,16 +795,12 @@ class Result(object):
                 with h5py.File(filename, 'w') as h5file:
                     recursively_save_dict_contents_to_group(h5file, '/', dictionary)
             elif extension == 'pkl':
-                import dill
-                with open(filename, "wb") as ff:
-                    dill.dump(self, ff)
+                safe_file_dump(self, filename, "dill")
             else:
                 raise ValueError("Extension type {} not understood".format(extension))
         except Exception as e:
-            import dill
             filename = ".".join(filename.split(".")[:-1]) + ".pkl"
-            with open(filename, "wb") as ff:
-                dill.dump(self, ff)
+            safe_file_dump(self, filename, "dill")
             logger.error(
                 "\n\nSaving the data has failed with the following message:\n"
                 "{}\nData has been dumped to {}.\n\n".format(e, filename)
@@ -1389,7 +1445,7 @@ class Result(object):
             data_frame['log_prior'] = self.log_prior_evaluations
 
         if conversion_function is not None:
-            if "npool" in inspect.getargspec(conversion_function).args:
+            if "npool" in inspect.signature(conversion_function).parameters:
                 data_frame = conversion_function(data_frame, likelihood, priors, npool=npool)
             else:
                 data_frame = conversion_function(data_frame, likelihood, priors)
@@ -1435,8 +1491,11 @@ class Result(object):
         if keys is None:
             keys = self.search_parameter_keys
         if self.injection_parameters is None:
-            raise(TypeError, "Result object has no 'injection_parameters'. "
-                             "Cannot compute credible levels.")
+            raise (
+                TypeError,
+                "Result object has no 'injection_parameters'. "
+                "Cannot compute credible levels."
+            )
         credible_levels = {key: self.get_injection_credible_level(key, weights=weights)
                            for key in keys
                            if isinstance(self.injection_parameters.get(key, None), float)}
@@ -1462,8 +1521,11 @@ class Result(object):
         float: credible level
         """
         if self.injection_parameters is None:
-            raise(TypeError, "Result object has no 'injection_parameters'. "
-                             "Cannot copmute credible levels.")
+            raise (
+                TypeError,
+                "Result object has no 'injection_parameters'. "
+                "Cannot copmute credible levels."
+            )
 
         if weights is None:
             weights = np.ones(len(self.posterior))
@@ -1672,7 +1734,7 @@ class Result(object):
 
 class ResultList(list):
 
-    def __init__(self, results=None):
+    def __init__(self, results=None, consistency_level="warning"):
         """ A class to store a list of :class:`bilby.core.result.Result` objects
         from equivalent runs on the same data. This provides methods for
         outputting combined results.
@@ -1681,8 +1743,15 @@ class ResultList(list):
         ==========
         results: list
             A list of `:class:`bilby.core.result.Result`.
+        consistency_level: str, [ignore, warning, error]
+            If warning, print a warning if inconsistencies are discovered
+            between the results. If error, raise an error if inconsistencies
+            are discovered between the results before combining. If ignore, do
+            nothing.
+
         """
         super(ResultList, self).__init__()
+        self.consistency_level = consistency_level
         for result in results:
             self.append(result)
 
@@ -1704,11 +1773,30 @@ class ResultList(list):
         else:
             raise TypeError("Could not append a non-Result type")
 
-    def combine(self, shuffle=False):
+    def combine(self, shuffle=False, consistency_level="error"):
         """
         Return the combined results in a :class:bilby.core.result.Result`
         object.
+
+        Parameters
+        ----------
+        shuffle: bool
+            If true, shuffle the samples when combining, otherwise they are concatenated.
+        consistency_level: str, [ignore, warning, error]
+            Overwrite the class level consistency_level. If warning, print a
+            warning if inconsistencies are discovered between the results. If
+            error, raise an error if inconsistencies are discovered between
+            the results before combining. If ignore, do nothing.
+
+        Returns
+        -------
+        result: bilby.core.result.Result
+            The combined result file
+
         """
+
+        self.consistency_level = consistency_level
+
         if len(self) == 0:
             return Result()
         elif len(self) == 1:
@@ -1838,24 +1926,43 @@ class ResultList(list):
             except ValueError:
                 raise ResultListError("Not all results contain nested samples")
 
+    def _error_or_warning_consistency(self, msg):
+        if self.consistency_level == "error":
+            raise ResultListError(msg)
+        elif self.consistency_level == "warning":
+            logger.warning(msg)
+        elif self.consistency_level == "ignore":
+            pass
+        else:
+            raise ValueError(f"Input consistency_level {self.consistency_level} not understood")
+
     def check_consistent_priors(self):
         for res in self:
             for p in self[0].priors.keys():
                 if not self[0].priors[p] == res.priors[p] or len(self[0].priors) != len(res.priors):
-                    raise ResultListError("Inconsistent priors between results")
+                    msg = "Inconsistent priors between results"
+                    self._error_or_warning_consistency(msg)
 
     def check_consistent_parameters(self):
         if not np.all([set(self[0].search_parameter_keys) == set(res.search_parameter_keys) for res in self]):
-            raise ResultListError("Inconsistent parameters between results")
+            msg = "Inconsistent parameters between results"
+            self._error_or_warning_consistency(msg)
 
     def check_consistent_data(self):
-        if not np.all([res.log_noise_evidence == self[0].log_noise_evidence for res in self])\
-                and not np.all([np.isnan(res.log_noise_evidence) for res in self]):
-            raise ResultListError("Inconsistent data between results")
+        if not np.allclose(
+            [res.log_noise_evidence for res in self],
+            self[0].log_noise_evidence,
+            atol=1e-8,
+            rtol=0.0,
+            equal_nan=True,
+        ):
+            msg = "Inconsistent data between results"
+            self._error_or_warning_consistency(msg)
 
     def check_consistent_sampler(self):
         if not np.all([res.sampler == self[0].sampler for res in self]):
-            raise ResultListError("Inconsistent samplers between results")
+            msg = "Inconsistent samplers between results"
+            self._error_or_warning_consistency(msg)
 
 
 @latex_plot_format
@@ -1933,12 +2040,17 @@ def plot_multiple(results, filename=None, labels=None, colours=None,
 
     if evidences:
         if np.isnan(results[0].log_bayes_factor):
-            template = r' $\mathrm{{ln}}(Z)={lnz:1.3g}$'
+            template = r'{label} $\mathrm{{ln}}(Z)={lnz:1.3g}$'
         else:
-            template = r' $\mathrm{{ln}}(B)={lnbf:1.3g}$'
-        labels = [template.format(lnz=result.log_evidence,
-                                  lnbf=result.log_bayes_factor)
-                  for ii, result in enumerate(results)]
+            template = r'{label} $\mathrm{{ln}}(B)={lnbf:1.3g}$'
+        labels = [
+            template.format(
+                label=label,
+                lnz=result.log_evidence,
+                lnbf=result.log_bayes_factor,
+            )
+            for label, result in zip(labels, results)
+        ]
 
     axes = fig.get_axes()
     ndim = int(np.sqrt(len(axes)))

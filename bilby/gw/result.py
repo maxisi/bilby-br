@@ -7,7 +7,7 @@ import numpy as np
 from ..core.result import Result as CoreResult
 from ..core.utils import (
     infft, logger, check_directory_exists_and_if_not_mkdir,
-    latex_plot_format, safe_save_figure
+    latex_plot_format, safe_file_dump, safe_save_figure,
 )
 from .utils import plot_spline_pos, spline_angle_xform, asd_from_freq_series
 from .detector import get_empty_interferometer, Interferometer
@@ -104,6 +104,12 @@ class CompactBinaryCoalescenceResult(CoreResult):
         """ The frequency domain source model (function)"""
         return self.__get_from_nested_meta_data(
             'likelihood', 'frequency_domain_source_model')
+
+    @property
+    def time_domain_source_model(self):
+        """ The time domain source model (function)"""
+        return self.__get_from_nested_meta_data(
+            'likelihood', 'time_domain_source_model')
 
     @property
     def parameter_conversion(self):
@@ -371,6 +377,10 @@ class CompactBinaryCoalescenceResult(CoreResult):
         logger.debug("Downsampling frequency mask to {} values".format(
             len(frequency_idxs))
         )
+        frequency_window_factor = (
+            np.sum(interferometer.frequency_mask)
+            / len(interferometer.frequency_mask)
+        )
         plot_times = interferometer.time_array[time_idxs]
         plot_times -= interferometer.strain_data.start_time
         start_time -= interferometer.strain_data.start_time
@@ -381,6 +391,7 @@ class CompactBinaryCoalescenceResult(CoreResult):
             duration=self.duration, sampling_frequency=self.sampling_frequency,
             start_time=self.start_time,
             frequency_domain_source_model=self.frequency_domain_source_model,
+            time_domain_source_model=self.time_domain_source_model,
             parameter_conversion=self.parameter_conversion,
             waveform_arguments=self.waveform_arguments)
 
@@ -440,10 +451,11 @@ class CompactBinaryCoalescenceResult(CoreResult):
                 fig.add_trace(
                     go.Scatter(
                         x=plot_times,
-                        y=infft(
-                            interferometer.whitened_frequency_domain_strain *
-                            np.sqrt(2. / interferometer.sampling_frequency),
-                            sampling_frequency=interferometer.strain_data.sampling_frequency)[time_idxs],
+                        y=np.fft.irfft(
+                            interferometer.whitened_frequency_domain_strain
+                            * np.sqrt(np.sum(interferometer.frequency_mask))
+                            / frequency_window_factor
+                        )[time_idxs],
                         fill=None,
                         mode='lines', line_color=DATA_COLOR,
                         opacity=0.5,
@@ -466,10 +478,11 @@ class CompactBinaryCoalescenceResult(CoreResult):
                     interferometer.amplitude_spectral_density_array[frequency_idxs],
                     color=DATA_COLOR, label='ASD')
                 axs[1].plot(
-                    plot_times, infft(
-                        interferometer.whitened_frequency_domain_strain *
-                        np.sqrt(2. / interferometer.sampling_frequency),
-                        sampling_frequency=interferometer.strain_data.sampling_frequency)[time_idxs],
+                    plot_times, np.fft.irfft(
+                        interferometer.whitened_frequency_domain_strain
+                        * np.sqrt(np.sum(interferometer.frequency_mask))
+                        / frequency_window_factor
+                    )[time_idxs],
                     color=DATA_COLOR, alpha=0.3)
             logger.debug('Plotted interferometer data.')
 
@@ -589,8 +602,8 @@ class CompactBinaryCoalescenceResult(CoreResult):
                 plot_frequencies,
                 np.percentile(fd_waveforms, lower_percentile, axis=0),
                 np.percentile(fd_waveforms, upper_percentile, axis=0),
-                color=WAVEFORM_COLOR, label=r'{}\% credible interval'.format(
-                    int(upper_percentile - lower_percentile)),
+                color=WAVEFORM_COLOR,
+                label=r'{}% credible interval'.format(int(upper_percentile - lower_percentile)),
                 alpha=0.3)
             axs[1].plot(
                 plot_times, np.mean(td_waveforms, axis=0),
@@ -774,8 +787,7 @@ class CompactBinaryCoalescenceResult(CoreResult):
             logger.info('Initialising skymap class')
             skypost = confidence_levels(pts, trials=trials, jobs=jobs)
             logger.info('Pickling skymap to {}'.format(default_obj_filename))
-            with open(default_obj_filename, 'wb') as out:
-                pickle.dump(skypost, out)
+            safe_file_dump(skypost, default_obj_filename, "pickle")
 
         else:
             if isinstance(load_pickle, str):

@@ -43,7 +43,7 @@ class BaseJointPriorDist(object):
                 if isinstance(bounds, (list, tuple, np.ndarray)):
                     if len(bound) != 2:
                         raise ValueError(
-                            "Bounds must contain an upper and " "lower value."
+                            "Bounds must contain an upper and lower value."
                         )
                     else:
                         if bound[1] <= bound[0]:
@@ -382,6 +382,7 @@ class MultivariateGaussianDist(BaseJointPriorDist):
         self.covs = []
         self.corrcoefs = []
         self.sigmas = []
+        self.logprodsigmas = []   # log of product of sigmas, needed for "standard" multivariate normal
         self.weights = []
         self.eigvalues = []
         self.eigvectors = []
@@ -399,7 +400,7 @@ class MultivariateGaussianDist(BaseJointPriorDist):
                 if len(np.shape(sigmas)) == 1:
                     sigmas = [sigmas]
                 elif len(np.shape(sigmas)) == 0:
-                    raise ValueError("Must supply a list of standard " "deviations")
+                    raise ValueError("Must supply a list of standard deviations")
             if covs is not None:
                 if isinstance(covs, np.ndarray):
                     covs = [covs]
@@ -421,7 +422,7 @@ class MultivariateGaussianDist(BaseJointPriorDist):
                             "List of correlation coefficients the wrong shape"
                         )
                 elif not isinstance(corrcoefs, list):
-                    raise TypeError("Must pass a list of correlation " "coefficients")
+                    raise TypeError("Must pass a list of correlation coefficients")
             if weights is not None:
                 if isinstance(weights, (int, float)):
                     weights = [weights]
@@ -489,7 +490,7 @@ class MultivariateGaussianDist(BaseJointPriorDist):
 
             if len(self.corrcoefs[-1].shape) != 2:
                 raise ValueError(
-                    "Correlation coefficient matrix must be a 2d " "array."
+                    "Correlation coefficient matrix must be a 2d array."
                 )
 
             if (
@@ -497,16 +498,16 @@ class MultivariateGaussianDist(BaseJointPriorDist):
                 or self.corrcoefs[-1].shape[0] != self.num_vars
             ):
                 raise ValueError(
-                    "Correlation coefficient matrix shape is " "inconsistent"
+                    "Correlation coefficient matrix shape is inconsistent"
                 )
 
             # check matrix is symmetric
             if not np.allclose(self.corrcoefs[-1], self.corrcoefs[-1].T):
-                raise ValueError("Correlation coefficient matrix is not " "symmetric")
+                raise ValueError("Correlation coefficient matrix is not symmetric")
 
             # check diagonal is all ones
             if not np.all(np.diag(self.corrcoefs[-1]) == 1.0):
-                raise ValueError("Correlation coefficient matrix is not" "correct")
+                raise ValueError("Correlation coefficient matrix is not correct")
 
             try:
                 self.sigmas.append(list(sigmas))  # standard deviations
@@ -528,6 +529,9 @@ class MultivariateGaussianDist(BaseJointPriorDist):
             self.covs.append(np.eye(self.num_vars))
             self.sigmas.append(np.ones(self.num_vars))
 
+        # compute log of product of sigmas, needed for "standard" multivariate normal
+        self.logprodsigmas.append(np.log(np.prod(self.sigmas[-1])))
+
         # get eigen values and vectors
         try:
             evals, evecs = np.linalg.eig(self.corrcoefs[-1])
@@ -535,13 +539,13 @@ class MultivariateGaussianDist(BaseJointPriorDist):
             self.eigvectors.append(evecs)
         except Exception as e:
             raise RuntimeError(
-                "Problem getting eigenvalues and vectors: " "{}".format(e)
+                "Problem getting eigenvalues and vectors: {}".format(e)
             )
 
         # check eigenvalues are positive
         if np.any(self.eigvalues[-1] <= 0.0):
             raise ValueError(
-                "Correlation coefficient matrix is not positive " "definite"
+                "Correlation coefficient matrix is not positive definite"
             )
         self.sqeigvalues.append(np.sqrt(self.eigvalues[-1]))
 
@@ -557,9 +561,16 @@ class MultivariateGaussianDist(BaseJointPriorDist):
         # add the mode
         self.nmodes += 1
 
-        # add multivariate Gaussian
+        # add "standard" multivariate normal distribution
+        # - when the typical scales of the parameters are very different,
+        #   multivariate_normal() may complain that the covariance matrix is singular
+        # - instead pass zero means and correlation matrix instead of covariance matrix
+        #   to get the equivalent of a standard normal distribution in higher dimensions
+        # - this modifies the multivariate normal PDF as follows:
+        #     multivariate_normal(mean=mus, cov=cov).logpdf(x)
+        #     = multivariate_normal(mean=0, cov=corrcoefs).logpdf((x - mus)/sigmas) - logprodsigmas
         self.mvn.append(
-            scipy.stats.multivariate_normal(mean=self.mus[-1], cov=self.covs[-1])
+            scipy.stats.multivariate_normal(mean=np.zeros(self.num_vars), cov=self.corrcoefs[-1])
         )
 
     def _rescale(self, samp, **kwargs):
@@ -630,7 +641,9 @@ class MultivariateGaussianDist(BaseJointPriorDist):
         for j in range(samp.shape[0]):
             # loop over the modes and sum the probabilities
             for i in range(self.nmodes):
-                lnprob[j] = np.logaddexp(lnprob[j], self.mvn[i].logpdf(samp[j]))
+                # self.mvn[i] is a "standard" multivariate normal distribution; see add_mode()
+                z = (samp[j] - self.mus[i]) / self.sigmas[i]
+                lnprob[j] = np.logaddexp(lnprob[j], self.mvn[i].logpdf(z) - self.logprodsigmas[i])
 
         # set out-of-bounds values to -inf
         lnprob[outbounds] = -np.inf
