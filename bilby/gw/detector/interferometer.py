@@ -315,8 +315,8 @@ class Interferometer(object):
         waveform_polarizations_circular['right'] = (waveform_polarizations['plus'] + (waveform_polarizations['cross'] * 1j)) / np.sqrt(2)
 
         # Apply amplitude birefringence modification
-        waveform_polarizations_circular['left'] *= np.exp((luminosity_distance_to_comoving_distance(parameters['luminosity_distance'])/1000) * parameters['kappa'] * (frequencies / 100))
-        waveform_polarizations_circular['right'] *= np.exp(-1 * (luminosity_distance_to_comoving_distance(parameters['luminosity_distance'])/1000) * parameters['kappa'] * (frequencies / 100)) 
+        waveform_polarizations_circular['left'][mask] *= np.exp((luminosity_distance_to_comoving_distance(parameters['luminosity_distance'])/1000) * parameters['kappa'] * (frequencies / 100))
+        waveform_polarizations_circular['right'][mask] *= np.exp(-1 * (luminosity_distance_to_comoving_distance(parameters['luminosity_distance'])/1000) * parameters['kappa'] * (frequencies / 100)) 
 
         # Transform circular polarizations to linear polarizations
         waveform_polarizations['plus'] = ((waveform_polarizations_circular['left'] + waveform_polarizations_circular['right']) * np.sqrt(2)) / 2
